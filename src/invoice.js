@@ -22,4 +22,3 @@ function subtotalPaise(items) {
 }
 
 module.exports = { subtotalPaise };
-// P9
