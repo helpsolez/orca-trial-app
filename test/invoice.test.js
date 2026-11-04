@@ -15,3 +15,4 @@ test('empty invoice is zero', () => {
 test('rejects negative quantity', () => {
   assert.throws(() => subtotalPaise([{ qty: -1, unitPricePaise: 100 }]), RangeError);
 });
+test('P6 break', () => { assert.equal(1, 2); });
