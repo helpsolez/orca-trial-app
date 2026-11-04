@@ -1,0 +1,157 @@
+name: sdlc-gate
+# Run 2 pilot of the merge gate (kit v1.4.2). Test repository only.
+# Checks a Founder-signed approval (ssh-keygen -Y verify against .github/approval_signers on the PR's base commit),
+# binds it to this PR's repo, issue, task, branch, start commit and files, rejects superseded approvals, and limits
+# the change. Runs no PR code. It runs on pull request events only: an edit to the approval comment does not re-run
+# it, so the Founder's merge check (run2-merge-check.ps1) is the final check before any merge.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+jobs:
+  sdlc-gate:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/github-script v7.0.1, pinned to its commit (git ls-remote, 2 Nov 2026)
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        env:
+          AI_LOGIN: Muffin-agent-ai
+          SIGNER_ID: helpsolez
+          SIGN_NAMESPACE: hiee-approval
+        with:
+          script: |
+            const { execFileSync } = require('child_process');
+            const fs = require('fs');
+            const os = require('os');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+            const AI = process.env.AI_LOGIN;
+            const SIGNER = process.env.SIGNER_ID;
+            const NS = process.env.SIGN_NAMESPACE;
+            const PROTECTED = /^(\.github\/|\.claude\/|\.codex\/|AGENTS\.md$|CLAUDE\.md$)/;
+            const fail = [];
+            const stop = () => { if (fail.length) { core.setFailed(fail.join('\n')); return true; } return false; };
+            // Always use fresh PR data, never the event's copy.
+            const pr = (await github.rest.pulls.get({ owner, repo, pull_number: context.payload.pull_request.number })).data;
+            const body = (pr.body || '').replace(/\r\n/g, '\n');
+            // G1: exactly one approval link, to a comment in this repository.
+            const apprLines = body.match(/^Approval:.*$/gm) || [];
+            if (apprLines.length !== 1) fail.push(`G1: PR body must contain exactly one "Approval:" line (found ${apprLines.length})`);
+            const m = apprLines.length === 1 ? apprLines[0].match(/^Approval:\s*https:\/\/github\.com\/([^\/\s]+)\/([^\/\s]+)\/issues\/(\d+)#issuecomment-(\d+)\s*$/) : null;
+            if (apprLines.length === 1 && !m) fail.push('G1: "Approval:" is not a link of the form https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id>');
+            if (m && (m[1] !== owner || m[2] !== repo)) fail.push('G1: approval link points to another repository');
+            const taskLines = body.match(/^Task:.*$/gm) || [];
+            if (taskLines.length !== 1) fail.push(`G1: PR body must contain exactly one "Task:" line (found ${taskLines.length})`);
+            if (stop()) return;
+            const issueNo = Number(m[3]);
+            let c;
+            try { c = (await github.rest.issues.getComment({ owner, repo, comment_id: Number(m[4]) })).data; }
+            catch (e) { fail.push('G2: approval comment not found'); stop(); return; }
+            if (!c.issue_url.endsWith(`/issues/${issueNo}`)) fail.push('G2: approval comment is not on the issue named in the link');
+            if (c.user.login !== SIGNER) fail.push(`G2: approval comment author is ${c.user.login}, not ${SIGNER}`);
+            // G2: one payload block and one signature block; any edit to either breaks the signature.
+            const P_BEGIN = '-----BEGIN HIEE APPROVAL-----', P_END = '-----END HIEE APPROVAL-----';
+            const S_BEGIN = '-----BEGIN SSH SIGNATURE-----', S_END = '-----END SSH SIGNATURE-----';
+            const count = (s, t) => s.split(t).length - 1;
+            const blocks = (raw) => {
+              const b = (raw || '').replace(/\r\n/g, '\n');
+              if ([P_BEGIN, P_END, S_BEGIN, S_END].some(t => count(b, t) !== 1)) return null;
+              return { payload: b.slice(b.indexOf(P_BEGIN), b.indexOf(P_END) + P_END.length) + '\n', sig: b.slice(b.indexOf(S_BEGIN), b.indexOf(S_END) + S_END.length) + '\n' };
+            };
+            const own = blocks(c.body);
+            if (!own) { fail.push('G2: approval must hold exactly one payload block and one signature block'); stop(); return; }
+            const payloadText = own.payload;
+            // The trusted key list comes from the PR's base commit (protected main), never from the PR branch.
+            let signers;
+            try {
+              const f = (await github.rest.repos.getContent({ owner, repo, path: '.github/approval_signers', ref: pr.base.sha })).data;
+              signers = Buffer.from(f.content, 'base64').toString('utf8');
+            } catch (e) { fail.push('G2: .github/approval_signers not found on the base commit'); stop(); return; }
+            const verify = (pText, sText) => {
+              const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
+              fs.writeFileSync(path.join(dir, 'signers'), signers);
+              fs.writeFileSync(path.join(dir, 'payload.sig'), sText);
+              try {
+                execFileSync('ssh-keygen', ['-Y', 'verify', '-f', path.join(dir, 'signers'), '-I', SIGNER, '-n', NS, '-s', path.join(dir, 'payload.sig')], { input: pText, stdio: ['pipe', 'pipe', 'pipe'] });
+                return true;
+              } catch (e) { return false; }
+            };
+            if (!verify(payloadText, own.sig)) { fail.push('G2: signature does not verify against the Founder key on the base commit'); stop(); return; }
+            // G2: strict payload schema (every field exactly once, valid values).
+            const KEYS = ['version', 'repo', 'issue', 'task', 'mode', 'seq', 'writer', 'base', 'branch', 'start_sha', 'prompt_sha256', 'max_lines', 'allowed_files'];
+            const RX = { version: /^2$/, repo: /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, issue: /^[1-9]\d*$/, task: /^[A-Z]+-\d{2}$/, mode: /^(initial|fix)$/, seq: /^[1-9]\d{0,2}$/, writer: /^[A-Za-z0-9-]+$/, base: /^main$/, branch: /^ai\/[A-Z]+-\d{2}$/, start_sha: /^[0-9a-f]{40}$/, prompt_sha256: /^[0-9a-f]{64}$/, max_lines: /^[1-9]\d{0,4}$/, allowed_files: /^[A-Za-z0-9_.\/-]+(, [A-Za-z0-9_.\/-]+)*$/ };
+            const p = {};
+            for (const line of payloadText.trim().split('\n').slice(1, -1)) {
+              const mm = line.match(/^([a-z_0-9]+): (.+)$/);
+              if (!mm) { fail.push(`G2: malformed payload line: ${line}`); continue; }
+              if (!KEYS.includes(mm[1])) { fail.push(`G2: unknown payload field ${mm[1]}`); continue; }
+              if (mm[1] in p) { fail.push(`G2: duplicate payload field ${mm[1]}`); continue; }
+              p[mm[1]] = mm[2].trim();
+            }
+            for (const k of KEYS) if (!(k in p)) fail.push(`G2: payload field ${k} missing`);
+            if (stop()) return;
+            for (const k of KEYS) if (!RX[k].test(p[k])) fail.push(`G2: payload field ${k} has an invalid value`);
+            if (stop()) return;
+            // G2: the approval must be the newest signed approval for this task on the issue. Comments whose blocks
+            // do not verify are ignored. (Limit: if the AI account edits the newer comment itself, only the
+            // Founder's local record, checked by the merge check, can tell.)
+            const all = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: issueNo, per_page: 100 });
+            for (const oc of all) {
+              if (oc.id === c.id || !oc.user || oc.user.login !== SIGNER) continue;
+              const ob = blocks(oc.body);
+              if (!ob || !verify(ob.payload, ob.sig)) continue;
+              const ot = ob.payload.match(/^task: (.+)$/m), os2 = ob.payload.match(/^seq: ([1-9]\d{0,2})$/m);
+              if (!ot || ot[1].trim() !== p.task || !os2) continue;
+              const oseq = Number(os2[1]);
+              if (oseq > Number(p.seq)) fail.push(`G2: approval seq ${p.seq} is superseded by a newer signed approval (seq ${oseq}, comment ${oc.id})`);
+              else if (oseq === Number(p.seq) && ob.payload !== payloadText) fail.push(`G2: two different signed approvals carry seq ${p.seq} for ${p.task}`);
+            }
+            // G1: the approval is for this repository, this issue and this task's branch.
+            if (p.repo !== `${owner}/${repo}`) fail.push('G1: payload repo is not this repository');
+            if (Number(p.issue) !== issueNo) fail.push('G1: payload issue differs from the issue the approval was posted on');
+            const taskLine = taskLines[0].match(/^Task:\s*#(\d+)\s*$/);
+            if (!taskLine || Number(taskLine[1]) !== issueNo) fail.push('G1: PR body line "Task: #<n>" is malformed or names another issue');
+            if (p.branch !== `ai/${p.task}`) fail.push('G1: payload branch must be ai/<task>');
+            // G4: written by the AI account, on the approved branch, into main, from this repository.
+            if (pr.user.login !== AI || p.writer !== AI) fail.push(`G4: PR author (${pr.user.login}) and payload writer (${p.writer}) must both be ${AI}`);
+            if (pr.base.ref !== p.base) fail.push(`G4: PR base ${pr.base.ref} is not ${p.base}`);
+            if (pr.head.ref !== p.branch) fail.push(`G4: PR head ${pr.head.ref} is not the approved branch ${p.branch}`);
+            if (!pr.head.repo || pr.head.repo.full_name !== `${owner}/${repo}`) fail.push('G4: PR does not come from a branch of this repository');
+            try {
+              const cmp = (await github.rest.repos.compareCommits({ owner, repo, base: p.start_sha, head: pr.head.sha })).data;
+              if (!['ahead', 'identical'].includes(cmp.status)) fail.push(`G4: PR head does not contain the approved start commit (compare: ${cmp.status})`);
+            } catch (e) { fail.push('G4: approved start commit not found'); }
+            // G3 scope guard and G5 size limit: only added or modified ordinary text files from the approved list.
+            if (pr.changed_files >= 3000) fail.push('G3: too many files to check');
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 });
+            if (files.length !== pr.changed_files) fail.push(`G3: file list incomplete (${files.length} of ${pr.changed_files})`);
+            const allowed = new Set(p.allowed_files.split(', '));
+            let changed = 0;
+            for (const f of files) {
+              changed += f.additions + f.deletions;
+              if (!['added', 'modified'].includes(f.status)) fail.push(`G3: ${f.filename} has status ${f.status}; only added or modified files are allowed`);
+              if (PROTECTED.test(f.filename)) fail.push(`G3: ${f.filename} is a protected path; no AI approval may cover it`);
+              if (!allowed.has(f.filename)) fail.push(`G3: ${f.filename} is not in the approved file list`);
+              if (typeof f.patch !== 'string') fail.push(`G3: ${f.filename} has no text diff (binary, too large, mode-only or empty change)`);
+            }
+            // G3: each changed file must be an ordinary file at the head: no symlink, submodule or executable mode.
+            try {
+              const treeSha = (await github.rest.git.getCommit({ owner, repo, commit_sha: pr.head.sha })).data.tree.sha;
+              const tree = (await github.rest.git.getTree({ owner, repo, tree_sha: treeSha, recursive: 'true' })).data;
+              if (tree.truncated) fail.push('G3: head tree too large to check file modes');
+              const entries = new Map(tree.tree.map(t => [t.path, t]));
+              for (const f of files) {
+                if (f.status === 'removed') continue;
+                const t = entries.get(f.filename);
+                if (!t || t.type !== 'blob' || t.mode !== '100644') fail.push(`G3: ${f.filename} is not an ordinary file at the head (mode ${t ? t.mode : 'missing'})`);
+              }
+            } catch (e) { fail.push('G3: could not read the head tree'); }
+            if (changed > Number(p.max_lines)) fail.push(`G5: ${changed} changed lines exceed the approved ${p.max_lines}`);
+            // G6: the head must not move while it is checked.
+            const now = (await github.rest.pulls.get({ owner, repo, pull_number: pr.number })).data;
+            if (now.head.sha !== pr.head.sha) fail.push('G6: PR head changed during the check; re-run the check');
+            core.info(`PR #${pr.number} head ${pr.head.sha}: approval ${m[4]} (${p.task}, ${p.mode}, seq ${p.seq}); ${files.length} files, ${changed} changed lines`);
+            if (!stop()) core.info('sdlc-gate: PASS');
