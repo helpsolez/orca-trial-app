@@ -4,3 +4,4 @@ Synthetic test project for the Orca Run 2 trial (2 Nov 2026). It contains no HIE
 Run the tests with `npm test` (Node.js 20 or later, no packages to install).
 PILOT-01
 P7
+PILOT-03
